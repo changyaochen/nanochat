@@ -11,7 +11,6 @@
 # You may also want to run this script manually and one by one, copy pasting commands into your terminal.
 
 # all the setup stuff
-export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
