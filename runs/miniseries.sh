@@ -57,8 +57,10 @@ for d in "${DEPTHS[@]}"; do
     TAG="${SERIES_NAME}_miniseries_d${d}"
     START_TIME=$(date +%s)
 
-    # For depths >= 22, use smaller device batch size to avoid OOM
-    if [ $d -ge 22 ]; then
+    # Reduce --device-batch-size to avoid OOM at larger depths
+    if [ $d -ge 28 ]; then
+        DEVICE_BATCH_SIZE_ARG="--device-batch-size=8"
+    elif [ $d -ge 20 ]; then
         DEVICE_BATCH_SIZE_ARG="--device-batch-size=16"
     else
         DEVICE_BATCH_SIZE_ARG="--device-batch-size=32"

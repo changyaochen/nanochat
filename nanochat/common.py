@@ -278,7 +278,7 @@ def compute_init(device_type: str = "cuda") -> tuple[bool, int, int, int, torch.
 
     # Precision
     if device_type == "cuda":
-        torch.backends.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
+        torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls, see https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     is_ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
