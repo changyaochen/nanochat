@@ -21,33 +21,21 @@ import time
 import math
 import argparse
 from dataclasses import asdict
-from contextlib import nullcontext, contextmanager
+from contextlib import contextmanager
 
 import torch
 import wandb
+import torch.distributed as dist
 
-from nanochat.checkpoint_manager import load_checkpoint
-from nanochat.checkpoint_manager import save_checkpoint
-from nanochat.common import DummyWandb
-from nanochat.common import autodetect_device_type
-from nanochat.common import compute_cleanup
-from nanochat.common import compute_init
-from nanochat.common import get_base_dir
-from nanochat.common import get_peak_flops
-from nanochat.common import print0
-from nanochat.common import print_banner
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.dataloader import (
-    tokenizing_distributed_data_loader_with_state_bos_bestfit,
-)
+from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
-from nanochat.gpt import GPT
-from nanochat.gpt import GPTConfig
-from nanochat.loss_eval import evaluate_bpb
 from nanochat.report import get_report
-from nanochat.tokenizer import get_token_bytes
-from nanochat.tokenizer import get_tokenizer
 from scripts.base_eval import evaluate_core
 
 print_banner()
@@ -114,7 +102,7 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
@@ -134,12 +122,7 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process: bool = (ddp_rank == 0)  # this process will do logging, checkpointing etc.
-autocast_ctx = (
-    torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
-    if device_type == "cuda"
-    else nullcontext()
-)
+master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = (
     torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -149,7 +132,8 @@ if device_type == "cuda":
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
-    gpu_peak_flops = float("inf")  # MFU not meaningful for CPU/MPS
+    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb: bool = (args.run == "dummy" or not master_process)
@@ -160,13 +144,16 @@ wandb_run = (
 )
 
 # Flash Attention status
-if HAS_FA3:
-    print0(
-        "✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome."
-    )
+from nanochat.flash_attention import USE_FA3
+using_fa3 = USE_FA3
+if using_fa3:
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
 else:
     print0("!" * 80)
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    else:
+        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3")
     if args.window_pattern != "L":
         print0(
@@ -239,23 +226,27 @@ if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        # our custom fp8 is simpler than torchao, written for exact API compatibility
+        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
-        # Filter: only convert layers with dimensions divisible by 16 (FP8 hardware requirement)
+        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
                 return False
-            # FP8 requires both in_features and out_features divisible by 16
             if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+            if min(mod.in_features, mod.out_features) < 128:
                 return False
             return True
 
         fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
         convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8_layers = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped} (dims not divisible by 16)")
+        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = num_linear - num_fp8
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
@@ -283,9 +274,9 @@ def disable_fp8(model):
         yield  # No FP8 modules, nothing to do
         return
 
-    # Swap Float8Linear -> nn.Linear (shares the same weight tensor, no copy)
+    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
     for parent, attr_name, fp8_module in fp8_locations:
-        linear = nn.Linear(
+        linear = Linear(
             fp8_module.in_features,
             fp8_module.out_features,
             bias=fp8_module.bias is not None,
@@ -384,6 +375,12 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+# -----------------------------------------------------------------------------
+# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
+scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+if scaler is not None:
+    print0("GradScaler enabled for fp16 training")
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -519,7 +516,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model), autocast_ctx:
+        with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
@@ -541,7 +538,7 @@ while True:
     )
     if should_eval_core:
         model.eval()
-        with disable_fp8(orig_model), autocast_ctx:
+        with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
@@ -572,7 +569,7 @@ while True:
         engine = Engine(orig_model, tokenizer)
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model), autocast_ctx:
+            with disable_fp8(orig_model):
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
@@ -598,6 +595,7 @@ while True:
                 "user_config": user_config,  # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
+                "total_batch_size": total_batch_size,
                 "dataloader_state_dict": dataloader_state_dict,
                 # All loop state (other than step) so that we can resume training
                 "loop_state": {
@@ -618,12 +616,13 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()  # for logging
-        # Each .backward() is a grad sum => normalize loss here.
-        loss = loss / grad_accum_steps
-        loss.backward()
+        loss = model(x, y)
+        train_loss = loss.detach() # for logging
+        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -634,7 +633,18 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
-    optimizer.step()
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        # In distributed training, all ranks must agree on whether to skip the step.
+        # Each rank may independently encounter inf/nan gradients, so we all-reduce
+        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        if is_ddp_initialized():
+            for v in scaler._found_inf_per_device(optimizer).values():
+                dist.all_reduce(v, op=dist.ReduceOp.MAX)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()  # .item() is a CPU-GPU sync point
     synchronize()
@@ -663,13 +673,8 @@ while True:
         eta_str = f" | eta: {eta_seconds / 60:.1f}m"
     else:
         eta_str = ""
-    epoch = dataloader_state_dict["epoch"]
-    print0(
-        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | "
-        f"loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | "
-        f"dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | "
-        f"epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
-    )
+    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
