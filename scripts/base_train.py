@@ -51,8 +51,6 @@ from nanochat.gpt import GPTConfig
 from nanochat.gpt import Linear
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.report import get_report
-from nanochat.tokenizer import get_token_bytes
-from nanochat.tokenizer import get_tokenizer
 from scripts.base_eval import evaluate_core
 
 print_banner()
