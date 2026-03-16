@@ -38,7 +38,7 @@ class GPTConfig:
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
 
-
+# ===== Utility Functions & Helpers =====
 def norm(x: Tensor) -> Tensor:
     """Applies RMSNorm to the input tensor without learnable parameters.
 
@@ -92,17 +92,33 @@ def has_ve(layer_idx: int, n_layer: int) -> bool:
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Applies rotary positional embeddings to the input tensor.
+    """Applies rotary positional embeddings (RoPE) to the input tensor.
+
+    Splits the head dimension in half and applies a 2D rotation to each pair
+    using the provided cos/sin frequencies, encoding absolute position
+    information into the representation.
 
     Args:
-        x: Input tensor of shape (B, T, H, D).
-        cos: Cosine component of rotary embeddings.
-        sin: Sine component of rotary embeddings.
+        x: Input tensor of shape ``(B, T, H, D)``.
+        cos: Cosine component of rotary embeddings, broadcastable to
+            ``(B, T, H, D // 2)``.
+        sin: Sine component of rotary embeddings, broadcastable to
+            ``(B, T, H, D // 2)``.
 
     Returns:
-        Tensor with rotary embeddings applied.
+        Tensor of the same shape as x with rotary embeddings applied.
+
+    Example::
+
+        >>> B, T, H, D = 1, 4, 2, 8
+        >>> x = torch.randn(B, T, H, D)
+        >>> freqs = torch.arange(D // 2).float().unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        >>> cos, sin = freqs.cos(), freqs.sin()
+        >>> out = apply_rotary_emb(x, cos, sin)
+        >>> out.shape
+        torch.Size([1, 4, 2, 8])
     """
-    assert x.ndim == 4  # multihead attention
+    assert x.ndim == 4  # multihead attention, i.e., with H heads
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]  # split up last dim into two halves
     y1 = x1 * cos + x2 * sin  # rotate pairs of dims
@@ -110,6 +126,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat([y1, y2], 3)
 
 
+# ===== Core Model Components =====
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with GQA, sliding windows, and value residual.
 
